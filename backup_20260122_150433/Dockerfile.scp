@@ -1,0 +1,26 @@
+FROM amd64/ubuntu
+
+MAINTAINER Carlos Queiroz
+LABEL version="0.1"
+
+
+ENV TZ=America/Sao_Paulo
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+
+
+
+RUN apt-get update \
+&& apt-get install -y dcmtk libgdcm-tools  libvtkgdcm-tools  rsync 
+
+
+EXPOSE 104 4100
+
+COPY receive.sh  /home/www/
+COPY storescp.cfg  /home/www/
+
+
+WORKDIR /home
+CMD /home/www/receive.sh ; sleep infinity
+
+

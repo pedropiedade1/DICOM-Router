@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  storescp:
+    build: ./scp
+    ports:
+      - "4100:4100"
+      - "${HTR_IP:-0.0.0.0}:104:104"
+    volumes:
+      - ./dicom:/home/dicom
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  storescu:
+    build: ./scu
+    environment:
+      - TARGET_HOST=${TARGET_HOST:-192.168.10.16}
+      - TARGET_PORT=${TARGET_PORT:-4243}
+      - TARGET_AET=${TARGET_AET:-ZEROCLICK}
+    # ports:
+    #   - "4242:4242"
+    volumes:
+      - ./dicom:/home/dicom
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./dicom:/home/dicom
+    restart: always
+

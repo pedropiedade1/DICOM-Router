@@ -1,0 +1,16 @@
+[Unit]
+Description=DICOM Router Service (Docker Compose)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Aponte para o diretório onde clonou o repositório
+WorkingDirectory=/home/prowess/dicomrs
+# Verifique o caminho do docker-compose com 'which docker-compose'
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target
