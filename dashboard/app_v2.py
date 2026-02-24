@@ -9,6 +9,16 @@ import subprocess
 import socket
 import os
 import shutil
+import io
+
+# Tenta importar dependências do visualizador CT
+try:
+    import pydicom
+    import numpy as np
+    from PIL import Image
+    VIEWER_AVAILABLE = True
+except ImportError:
+    VIEWER_AVAILABLE = False
 
 # Configuração da Página
 st.set_page_config(
@@ -18,14 +28,36 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("🏥 DICOM Router - Painel de Controle Avançado")
+st.markdown("#### 🏥 DICOM Router - Painel de Controle")
+
+# CSS compacto para Full HD widescreen (1920x1080)
+st.markdown("""<style>
+    .block-container {padding-top: 0.75rem; padding-bottom: 0;}
+    h1 {font-size: 1.3rem !important;}
+    h2, [data-testid="stHeadingWithActionElements"] {font-size: 1.05rem !important;}
+    h3 {font-size: 0.95rem !important;}
+    h4 {font-size: 1.1rem !important; margin-bottom: 0.25rem !important;}
+    p, li, .stMarkdown span, .stText {font-size: 0.82rem !important;}
+    [data-testid="stMetricLabel"] p {font-size: 0.7rem !important;}
+    [data-testid="stMetricValue"] {font-size: 1rem !important;}
+    [data-baseweb="tab"] {font-size: 0.8rem !important; padding: 0.35rem 0.6rem !important;}
+    .stExpander {margin-bottom: 0.2rem !important;}
+    div[data-testid="stExpander"] details summary p {font-size: 0.82rem !important;}
+    .stSelectbox label, .stNumberInput label, .stSlider label {font-size: 0.78rem !important;}
+    .stSelectbox, .stNumberInput {margin-bottom: 0.25rem !important;}
+    .stDivider {margin: 0.4rem 0 !important;}
+    [data-testid="stSidebar"] .stMarkdown p {font-size: 0.78rem !important;}
+    [data-testid="stSidebar"] .stAlert p {font-size: 0.75rem !important;}
+    [data-testid="stImage"] {margin-bottom: 0 !important;}
+    .stCaption, [data-testid="stCaptionContainer"] p {font-size: 0.72rem !important;}
+</style>""", unsafe_allow_html=True)
 
 # Constantes
-DICOM_ROOT = Path("/home/dicom")
+DICOM_ROOT = Path(os.getenv("DICOM_ROOT", "/home/dicom"))
 METADATA_FILE = DICOM_ROOT / ".metadata.json"
 STATUS_FILE = DICOM_ROOT / ".send_status.json"
 ENV_FILE = Path("/home/prowess/dicomrs/.env")
-DICOM_ARCHIVE_ROOT = Path("/home/dicom")  # Pasta com estudos organizados
+DICOM_ARCHIVE_ROOT = Path(os.getenv("DICOM_ROOT", "/home/dicom"))  # Pasta com estudos organizados
 
 # --- Funções Auxiliares ---
 
@@ -93,7 +125,7 @@ def save_metadata(metadata):
         return False
 
 def get_study_folders():
-    """Lista pastas de estudos no disco com status de envio"""
+    """Lista pastas de estudos no disco com status de envio, mais recentes primeiro"""
     folders = []
     status_data = load_send_status()
     try:
@@ -102,9 +134,19 @@ def get_study_folders():
                 dcm_files = list(d.glob("*.dcm"))
                 if dcm_files:
                     study_status = status_data.get(d.name, {})
+                    # Extrai nome do paciente e data do nome da pasta: YYYYMMDD_HHMMSS_ID_NOME
+                    parts = d.name.split('_', 3)
+                    if len(parts) >= 4:
+                        patient_name = parts[3]
+                        date_str = parts[0]
+                        display_date = f"{date_str[6:8]}/{date_str[4:6]}/{date_str[:4]}" if len(date_str) == 8 else date_str
+                        display_name = f"{patient_name} ({display_date})"
+                    else:
+                        display_name = d.name
                     folders.append({
                         'path': d,
                         'name': d.name,
+                        'display_name': display_name,
                         'file_count': len(dcm_files),
                         'size_mb': sum(f.stat().st_size for f in dcm_files) / (1024*1024),
                         'status': study_status.get('status', 'pendente'),
@@ -115,6 +157,8 @@ def get_study_folders():
                     })
     except Exception as e:
         st.error(f"Erro ao listar pastas: {e}")
+    # Ordena por nome da pasta decrescente (mais recentes primeiro)
+    folders.sort(key=lambda f: f['name'], reverse=True)
     return folders
 
 def resend_study(folder_path: Path, target_host: str, target_port: str, target_aet: str):
@@ -174,7 +218,8 @@ def check_port_listening(port):
         # Tenta conectar na porta para verificar se está escutando
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
-        result = sock.connect_ex(('172.22.61.14', int(port)))
+        htr_ip = os.getenv("HTR_IP", "172.22.61.14")
+        result = sock.connect_ex((htr_ip, int(port)))
         sock.close()
         if result == 0:
             return True
@@ -198,6 +243,107 @@ def get_firewall_status():
     except:
         return "Erro ao verificar firewall"
 
+def delete_study(folder_path: Path):
+    """Deleta pasta do estudo e limpa metadados/status"""
+    folder_name = folder_path.name
+    try:
+        shutil.rmtree(folder_path)
+        # Remove do status de envio
+        status_data = load_send_status()
+        status_data.pop(folder_name, None)
+        save_send_status(status_data)
+        # Remove dos metadados
+        metadata = load_metadata()
+        keys_to_remove = [k for k, v in metadata.items() if v.get('folder') == folder_name]
+        for k in keys_to_remove:
+            del metadata[k]
+        if keys_to_remove:
+            save_metadata(metadata)
+        return True, "Estudo deletado com sucesso"
+    except Exception as e:
+        return False, f"Erro ao deletar: {e}"
+
+# --- Funções do Visualizador CT ---
+
+CT_PRESETS = {
+    "Tecido Mole": {"wc": 40, "ww": 400},
+    "Pulmão": {"wc": -600, "ww": 1500},
+    "Osso": {"wc": 400, "ww": 1800},
+    "Cérebro": {"wc": 40, "ww": 80},
+    "Mediastino": {"wc": 50, "ww": 350},
+    "Fígado": {"wc": 60, "ww": 150},
+}
+
+if VIEWER_AVAILABLE:
+    @st.cache_data(ttl=300)
+    def get_sorted_dcm_files(study_path_str: str) -> list[str]:
+        """Lista e ordena arquivos .dcm por InstanceNumber (headers only)."""
+        study_path = Path(study_path_str)
+        dcm_files = list(study_path.glob("*.dcm"))
+        if not dcm_files:
+            return []
+        indexed = []
+        for f in dcm_files:
+            try:
+                ds = pydicom.dcmread(str(f), stop_before_pixels=True)
+                idx = int(getattr(ds, "InstanceNumber", 0))
+            except Exception:
+                idx = 0
+            indexed.append((idx, str(f)))
+        indexed.sort(key=lambda x: x[0])
+        return [path for _, path in indexed]
+
+    @st.cache_data(ttl=300)
+    def get_study_info(study_path_str: str) -> dict:
+        """Extrai metadados do paciente do primeiro DICOM."""
+        study_path = Path(study_path_str)
+        dcm_files = list(study_path.glob("*.dcm"))
+        if not dcm_files:
+            return {}
+        try:
+            ds = pydicom.dcmread(str(dcm_files[0]), stop_before_pixels=True)
+            raw_name = str(getattr(ds, "PatientName", "N/A"))
+            # Limpa separadores DICOM (^ e =) para exibição
+            clean_name = ' '.join(raw_name.replace('^', ' ').replace('=', ' ').split())
+            return {
+                "patient_name": clean_name,
+                "patient_id": str(getattr(ds, "PatientID", "N/A")),
+                "study_date": str(getattr(ds, "StudyDate", "N/A")),
+                "modality": str(getattr(ds, "Modality", "N/A")),
+                "total_slices": len(dcm_files),
+            }
+        except Exception:
+            return {"patient_name": "N/A", "patient_id": "N/A", "study_date": "N/A", "modality": "N/A", "total_slices": len(dcm_files)}
+
+    def apply_ct_windowing(pixel_array: "np.ndarray", intercept: float, slope: float, wc: int, ww: int) -> "np.ndarray":
+        """Converte pixel data para HU e aplica janelamento Window/Level."""
+        hu = pixel_array.astype(np.float64) * slope + intercept
+        lower = wc - ww / 2
+        upper = wc + ww / 2
+        img = np.clip(hu, lower, upper)
+        img = ((img - lower) / (upper - lower) * 255).astype(np.uint8)
+        return img
+
+    @st.cache_data(ttl=600, max_entries=500)
+    def render_slice(dcm_path: str, wc: int, ww: int, size: tuple[int, int] | None = None) -> bytes | None:
+        """Lê DICOM, aplica janelamento, retorna PNG bytes."""
+        try:
+            ds = pydicom.dcmread(dcm_path)
+            if not hasattr(ds, "PixelData"):
+                return None
+            pixel_array = ds.pixel_array
+            intercept = float(getattr(ds, "RescaleIntercept", 0))
+            slope = float(getattr(ds, "RescaleSlope", 1))
+            img_array = apply_ct_windowing(pixel_array, intercept, slope, wc, ww)
+            img = Image.fromarray(img_array, mode="L")
+            if size:
+                img = img.resize(size, Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return None
+
 # --- Conexão Docker ---
 try:
     client = docker.from_env()
@@ -219,6 +365,7 @@ dash_container = get_container("dashboard")
 # --- Carrega Configurações ---
 env_vars = load_env()
 HTR_IP = env_vars.get('HTR_IP', '172.22.61.14')
+SCP_PORT = env_vars.get('SCP_PORT', '104')
 TARGET_HOST = env_vars.get('TARGET_HOST', '192.168.10.16')
 TARGET_PORT = env_vars.get('TARGET_PORT', '4243')
 TARGET_AET = env_vars.get('TARGET_AET', 'ZEROCLICK')
@@ -254,11 +401,11 @@ st.sidebar.divider()
 st.sidebar.subheader("🌐 Conectividade")
 
 # Teste Rede HTR
-htr_listening = check_port_listening(104)
+htr_listening = check_port_listening(SCP_PORT)
 if htr_listening:
-    st.sidebar.success(f"✅ Porta 104 escutando em {HTR_IP}")
+    st.sidebar.success(f"✅ Porta {SCP_PORT} escutando em {HTR_IP}")
 else:
-    st.sidebar.error("❌ Porta 104 não está escutando")
+    st.sidebar.error(f"❌ Porta {SCP_PORT} não está escutando")
 
 # Teste Rede Clínica
 target_reachable = test_connection(TARGET_HOST, TARGET_PORT)
@@ -287,163 +434,180 @@ if auto_refresh:
     st.rerun()
 
 # ==================== ABAS PRINCIPAIS ====================
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Estudos DICOM", "📝 Logs em Tempo Real", "🔧 Diagnóstico", "⚙️ Configurações"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Estudos DICOM", "🖼️ Visualizador CT", "📝 Logs em Tempo Real", "🔧 Diagnóstico", "⚙️ Configurações"])
 
 # ==================== ABA 1: ESTUDOS DICOM ====================
 with tab1:
-    st.subheader("📁 Estudos Recebidos e em Processamento")
-    
-    # Carrega pastas do disco diretamente
     study_folders = get_study_folders()
-    
+
     if not study_folders:
-        st.info("ℹ️ Nenhum estudo recebido ainda. Aguardando imagens da tomografia...")
+        st.info("Nenhum estudo recebido ainda. Aguardando imagens...")
     else:
-        # Métricas
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric("Total de Estudos", len(study_folders))
-        with col2:
-            total_images = sum([f['file_count'] for f in study_folders])
-            st.metric("Total de Imagens", total_images)
-        with col3:
-            enviados = len([f for f in study_folders if f['status'] == 'enviado'])
-            st.metric("✅ Enviados", enviados)
-        with col4:
-            falhas = len([f for f in study_folders if f['status'] == 'falha'])
-            st.metric("❌ Falhas", falhas)
-        with col5:
-            pendentes = len([f for f in study_folders if f['status'] == 'pendente'])
-            st.metric("⏳ Pendentes", pendentes)
-        
+        # Métricas compactas
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+        mc1.metric("Estudos", len(study_folders))
+        mc2.metric("Imagens", sum(f['file_count'] for f in study_folders))
+        mc3.metric("Enviados", len([f for f in study_folders if f['status'] == 'enviado']))
+        mc4.metric("Falhas", len([f for f in study_folders if f['status'] == 'falha']))
+        mc5.metric("Pendentes", len([f for f in study_folders if f['status'] == 'pendente']))
+
         st.divider()
-        
-        # Lista de estudos com botão de reenvio
-        st.write("### 📋 Lista de Estudos no Disco")
-        
-        # Função para obter ícone de status
+
         def get_status_icon(status):
-            icons = {
-                'enviado': '✅',
-                'falha': '❌',
-                'pendente': '⏳',
-                'enviando': '🔄'
-            }
-            return icons.get(status, '❓')
-        
-        def get_status_color(status):
-            colors = {
-                'enviado': 'green',
-                'falha': 'red',
-                'pendente': 'orange',
-                'enviando': 'blue'
-            }
-            return colors.get(status, 'gray')
-        
+            return {'enviado': '✅', 'falha': '❌', 'pendente': '⏳', 'enviando': '🔄'}.get(status, '❓')
+
         for idx, folder in enumerate(study_folders):
-            status_icon = get_status_icon(folder['status'])
-            status_text = folder['status'].upper()
-            
-            with st.expander(f"{status_icon} {folder['name']} ({folder['file_count']} imagens) - **{status_text}**", expanded=False):
-                col1, col2, col3 = st.columns([3, 1, 1])
-                
-                with col1:
-                    st.write(f"**Pasta:** `{folder['path']}`")
-                    st.write(f"**Arquivos DICOM:** {folder['file_count']}")
-                    st.write(f"**Tamanho:** {folder['size_mb']:.2f} MB")
-                    
-                    # Mostrar status detalhado
-                    st.divider()
-                    status_color = get_status_color(folder['status'])
-                    st.markdown(f"**Status:** :{status_color}[{status_icon} {status_text}]")
-                    
-                    if folder['last_update']:
-                        st.write(f"**Última atualização:** {folder['last_update']}")
-                    
+            s_icon = get_status_icon(folder['status'])
+            s_text = folder['status'].upper()
+
+            with st.expander(f"{s_icon} {folder['display_name']} — {folder['file_count']} img — **{s_text}**"):
+                info_col, btn_col = st.columns([5, 2])
+
+                with info_col:
+                    st.caption(
+                        f"Pasta: `{folder['name']}` | {folder['size_mb']:.1f} MB"
+                        + (f" | Atualizado: {folder['last_update']}" if folder['last_update'] else "")
+                        + (f" | {folder['sent_count']}/{folder['total_count']} enviados" if folder['total_count'] > 0 else "")
+                    )
                     if folder['status_message']:
-                        st.write(f"**Mensagem:** {folder['status_message'][:100]}")
-                    
-                    if folder['status'] in ['enviado', 'falha'] and folder['total_count'] > 0:
-                        st.write(f"**Enviados:** {folder['sent_count']}/{folder['total_count']} arquivos")
-                
-                with col2:
-                    # Botão de Reenvio
-                    if st.button("🔄 Reenviar ao ZeroClick", key=f"resend_{idx}", type="primary", use_container_width=True):
-                        with st.spinner(f"Reenviando estudo para {TARGET_HOST}:{TARGET_PORT}..."):
-                            success, message = resend_study(
-                                folder['path'], 
-                                TARGET_HOST, 
-                                TARGET_PORT, 
-                                TARGET_AET
-                            )
-                            if success:
-                                st.success(f"✅ {message}")
-                            else:
-                                st.error(f"❌ {message}")
-                            st.rerun()
-                
-                with col3:
-                    # Botão para ver arquivos
-                    if st.button("📂 Ver Arquivos", key=f"view_{idx}", use_container_width=True):
-                        try:
+                        st.caption(f"Msg: {folder['status_message'][:120]}")
+
+                with btn_col:
+                    b1, b2, b3 = st.columns(3)
+                    with b1:
+                        if st.button("🔄 Reenviar", key=f"resend_{idx}", type="primary", use_container_width=True):
+                            with st.spinner("Enviando..."):
+                                success, message = resend_study(folder['path'], TARGET_HOST, TARGET_PORT, TARGET_AET)
+                                if success:
+                                    st.success(message)
+                                else:
+                                    st.error(message)
+                                st.rerun()
+                    with b2:
+                        if st.button("📂 Arquivos", key=f"view_{idx}", use_container_width=True):
                             files = list(folder['path'].glob("*.dcm"))[:20]
-                            st.write("**Primeiros 20 arquivos:**")
                             for f in files:
-                                st.text(f"• {f.name}")
+                                st.caption(f"• {f.name}")
                             if folder['file_count'] > 20:
-                                st.text(f"... e mais {folder['file_count'] - 20} arquivos")
-                        except Exception as e:
-                            st.error(f"Erro: {e}")
-        
+                                st.caption(f"... +{folder['file_count'] - 20}")
+                    with b3:
+                        with st.popover("🗑️ Deletar", use_container_width=True):
+                            st.warning(f"Excluir **{folder['display_name']}** permanentemente?")
+                            if st.button("Confirmar exclusão", key=f"del_{idx}", type="primary"):
+                                ok, msg = delete_study(folder['path'])
+                                if ok:
+                                    st.success(msg)
+                                    time.sleep(0.5)
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+
         st.divider()
-        
-        # Reenvio em lote
-        st.write("### 🔄 Reenvio em Lote")
-        col1, col2 = st.columns(2)
-        
-        with col1:
+
+        # Reenvio em lote compacto
+        batch_col1, batch_col2 = st.columns([3, 1])
+        with batch_col1:
             selected_studies = st.multiselect(
-                "Selecione os estudos para reenviar:",
+                "Reenvio em lote:",
                 options=[f['name'] for f in study_folders],
+                format_func=lambda n: next((f['display_name'] for f in study_folders if f['name'] == n), n),
                 key="batch_select"
             )
-        
-        with col2:
-            if st.button("🚀 Reenviar Selecionados", type="primary", disabled=len(selected_studies) == 0):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for i, study_name in enumerate(selected_studies):
-                    folder = next((f for f in study_folders if f['name'] == study_name), None)
-                    if folder:
-                        status_text.text(f"Enviando: {study_name}...")
-                        success, message = resend_study(
-                            folder['path'], 
-                            TARGET_HOST, 
-                            TARGET_PORT, 
-                            TARGET_AET
-                        )
-                        if success:
-                            st.success(f"✅ {study_name}: Enviado com sucesso!")
-                        else:
-                            st.error(f"❌ {study_name}: {message}")
-                    
-                    progress_bar.progress((i + 1) / len(selected_studies))
-                
-                status_text.text("Concluído!")
-        
-        st.divider()
-        
-        # Informações de disco
-        st.write("### 💾 Uso de Disco")
-        try:
-            result = subprocess.run("df -h /home/dicom", shell=True, capture_output=True, text=True)
-            st.code(result.stdout, language="bash")
-        except:
-            st.warning("Não foi possível verificar uso de disco")
+        with batch_col2:
+            st.write("")  # spacing
+            if st.button("🚀 Reenviar Selecionados", type="primary", disabled=len(selected_studies) == 0, use_container_width=True):
+                bar = st.progress(0)
+                for i, sn in enumerate(selected_studies):
+                    fl = next((f for f in study_folders if f['name'] == sn), None)
+                    if fl:
+                        ok, msg = resend_study(fl['path'], TARGET_HOST, TARGET_PORT, TARGET_AET)
+                        (st.success if ok else st.error)(f"{fl['display_name']}: {msg}")
+                    bar.progress((i + 1) / len(selected_studies))
 
-# ==================== ABA 2: LOGS ====================
+        # Disco compacto
+        try:
+            disk = subprocess.run("df -h /home/dicom --output=size,used,avail,pcent", shell=True, capture_output=True, text=True)
+            st.caption(f"💾 Disco: {disk.stdout.strip().splitlines()[-1].strip()}")
+        except:
+            pass
+
+# ==================== ABA 2: VISUALIZADOR CT ====================
 with tab2:
+    if not VIEWER_AVAILABLE:
+        st.warning("Dependências do visualizador não disponíveis. Instale: `pydicom numpy Pillow`")
+    else:
+        viewer_folders = get_study_folders()
+        if not viewer_folders:
+            st.info("Nenhum estudo encontrado.")
+        else:
+            # Barra de controles compacta — tudo em uma linha
+            sel_c, preset_c, wc_c, ww_c = st.columns([3, 2, 1, 1])
+            with sel_c:
+                viewer_names = [f["name"] for f in viewer_folders]
+                selected_vname = st.selectbox(
+                    "Paciente:",
+                    options=viewer_names,
+                    format_func=lambda n: next((f['display_name'] for f in viewer_folders if f['name'] == n), n),
+                    key="ct_viewer_study"
+                )
+                selected_vfolder = next(f for f in viewer_folders if f["name"] == selected_vname)
+            with preset_c:
+                preset_name = st.selectbox("Preset:", list(CT_PRESETS.keys()), key="ct_preset")
+            preset = CT_PRESETS[preset_name]
+            with wc_c:
+                wc = st.number_input("WC", value=preset["wc"], step=10, key="ct_wc")
+            with ww_c:
+                ww = st.number_input("WW", value=preset["ww"], min_value=1, step=10, key="ct_ww")
+
+            study_path_str = str(selected_vfolder["path"])
+
+            # Info compacta em uma linha
+            info = get_study_info(study_path_str)
+            if info:
+                st.caption(
+                    f"**{info.get('patient_name', 'N/A')}** | "
+                    f"ID: {info.get('patient_id', 'N/A')} | "
+                    f"Data: {info.get('study_date', 'N/A')} | "
+                    f"{info.get('modality', 'N/A')} | "
+                    f"{info.get('total_slices', 0)} fatias"
+                )
+
+            sorted_files = get_sorted_dcm_files(study_path_str)
+            if not sorted_files:
+                st.warning("Nenhum arquivo DICOM encontrado neste estudo.")
+            else:
+                total = len(sorted_files)
+
+                # Layout 2 colunas: controles+thumbs à esquerda, imagem à direita
+                panel_left, panel_right = st.columns([1, 3])
+
+                with panel_left:
+                    slice_idx = st.slider("Fatia", 0, total - 1, total // 2, key="ct_slice_slider")
+                    st.caption(f"Fatia {slice_idx + 1} / {total}")
+
+                    # Thumbnails compactos no painel esquerdo
+                    max_thumbs = 12
+                    step = max(1, total // max_thumbs)
+                    thumb_indices = list(range(0, total, step))[:max_thumbs]
+
+                    cols_per_row = 3
+                    for row_start in range(0, len(thumb_indices), cols_per_row):
+                        row_indices = thumb_indices[row_start:row_start + cols_per_row]
+                        tcols = st.columns(cols_per_row)
+                        for tc, tidx in zip(tcols, row_indices):
+                            tb = render_slice(sorted_files[tidx], wc, ww, size=(96, 96))
+                            if tb:
+                                tc.image(tb, caption=f"#{tidx + 1}", use_container_width=True)
+
+                with panel_right:
+                    img_bytes = render_slice(sorted_files[slice_idx], wc, ww)
+                    if img_bytes:
+                        st.image(img_bytes, use_container_width=True)
+                    else:
+                        st.warning(f"Sem imagem para fatia {slice_idx + 1}.")
+
+# ==================== ABA 3: LOGS ====================
+with tab3:
     def parse_logs(container, lines=100):
         if not container:
             return []
@@ -468,8 +632,8 @@ with tab2:
         else:
             st.info("Container SCU não encontrado")
 
-# ==================== ABA 3: DIAGNÓSTICO ====================
-with tab3:
+# ==================== ABA 4: DIAGNÓSTICO ====================
+with tab4:
     st.subheader("🔧 Informações de Diagnóstico")
     
     diag_col1, diag_col2 = st.columns(2)
@@ -549,8 +713,8 @@ Ping Zero Click ({TARGET_HOST}):
             )
             st.code(report, language="bash")
 
-# ==================== ABA 4: CONFIGURAÇÕES ====================
-with tab4:
+# ==================== ABA 5: CONFIGURAÇÕES ====================
+with tab5:
     st.subheader("⚙️ Configurações do Sistema")
     
     st.write("**Arquivo .env atual:**")

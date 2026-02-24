@@ -12,17 +12,59 @@ from datetime import datetime
 import shutil
 import json
 
-DICOM_ROOT = Path("/home/dicom")
+DICOM_ROOT = Path(os.getenv("DICOM_ROOT", "/home/dicom"))
 METADATA_FILE = DICOM_ROOT / ".metadata.json"
+QUARANTINE_DIR = DICOM_ROOT / "_INVALID_NO_PIXELS"
+IMAGE_MODALITIES = {
+    "CR", "CT", "DX", "IO", "MG", "MR", "NM", "OT", "PT", "RF",
+    "RTIMAGE", "US", "XA", "XC",
+}
 
 def sanitize_filename(text):
     """Remove caracteres inválidos"""
     if not text:
         return "UNKNOWN"
+    # Substitui separadores DICOM de PersonName por espaço
+    text = text.replace('^', ' ').replace('=', ' ')
+    # Remove caracteres problemáticos para filesystem
     invalid_chars = '<>:"/\\|?*'
     for char in invalid_chars:
         text = text.replace(char, '_')
-    return text.strip()[:50] or "UNKNOWN"  # Limita tamanho
+    # Colapsa espaços múltiplos e limita tamanho
+    text = ' '.join(text.split())
+    return text.strip()[:50] or "UNKNOWN"
+
+def dataset_requires_pixel_data(ds):
+    modality = str(getattr(ds, "Modality", "")).upper()
+    if modality in IMAGE_MODALITIES:
+        return True
+    return hasattr(ds, "Rows") and hasattr(ds, "Columns")
+
+def dataset_has_pixel_data(ds):
+    return (
+        "PixelData" in ds
+        or "FloatPixelData" in ds
+        or "DoubleFloatPixelData" in ds
+    )
+
+def validate_image_dicom_has_pixels(filepath):
+    ds = pydicom.dcmread(filepath, stop_before_pixels=False)
+    if not dataset_requires_pixel_data(ds):
+        return True, "nao e imagem"
+    if not dataset_has_pixel_data(ds):
+        return False, "DICOM de imagem sem PixelData"
+    return True, "ok"
+
+def quarantine_invalid_dicom(filepath, reason):
+    src = Path(filepath)
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = QUARANTINE_DIR / src.name
+    counter = 1
+    while dest.exists():
+        dest = QUARANTINE_DIR / f"{src.stem}_{counter}{src.suffix}"
+        counter += 1
+    shutil.move(str(src), str(dest))
+    print(f"✗ Quarentena: {dest.name} ({reason})")
 
 def load_metadata():
     """Carrega metadados de estudos conhecidos"""
@@ -87,6 +129,11 @@ def get_or_create_study_folder(ds):
 def organize_file(filepath):
     """Organiza um arquivo DICOM"""
     try:
+        ok_pixels, reason = validate_image_dicom_has_pixels(filepath)
+        if not ok_pixels:
+            quarantine_invalid_dicom(filepath, reason)
+            return False
+
         # Lê metadados
         ds = pydicom.dcmread(filepath, stop_before_pixels=True)
         

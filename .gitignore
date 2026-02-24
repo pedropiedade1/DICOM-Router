@@ -1,0 +1,6 @@
+.env
+dicom/
+scp/__pycache__/
+scu/__pycache__/
+dashboard/__pycache__/
+*.pyc

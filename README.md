@@ -90,7 +90,58 @@ O servidor hospedeiro deve possuir duas interfaces de rede (NICs) ou rotas disti
 2.  **Validação de AETitle:** O serviço de recepção (`storescp`) está configurado em modo "promíscuo", aceitando conexões de qualquer AETitle. Isso visa operacionalidade para evitar rejeições por erros de configuração nas modalidades, mas não implementa lista branca de dispositivos.
 3.  **Isolamento de Processos:** Os serviços rodam em containers Docker com privilégios limitados, sem acesso direto ao restante do sistema de arquivos do host além do volume compartilhado.
 
+## Integridade DICOM (PixelData) - Regras Críticas
+
+### Risco identificado (corrigido)
+Foi identificado um cenário de corrupção de imagens CT em que o arquivo DICOM era:
+1. lido com `pydicom.dcmread(..., stop_before_pixels=True)` (somente metadados), e
+2. salvo novamente com `save_as(...)`.
+
+Isso pode remover o elemento `PixelData` e gerar arquivos DICOM com cabeçalho válido, porém sem imagem (incompatíveis com viewers como Eclipse/Varian).
+
+### Regras obrigatórias
+1. **Nunca regravar (`save_as`) um DICOM lido com `stop_before_pixels=True`.**
+2. **Sempre validar `PixelData` em DICOMs de imagem (CT/MR/etc.) antes de enviar ou organizar.**
+3. **Arquivos de imagem sem `PixelData` devem ir para quarentena, nunca seguir o fluxo normal.**
+
+### Proteções implementadas
+- `storescu` (`dicomrs/scu/scu_script.py`)
+  - Validação de integridade (`PixelData`) antes do envio.
+  - Quarentena automática em `/home/dicom/_INVALID_NO_PIXELS`.
+  - Proteção contra regressão para evitar `save_as()` perigoso após leitura parcial.
+- `storescp` / organizadores (`dicomrs/scp/receive_organized.py`, `dicomrs/scp/organizer.py`)
+  - Validação de `PixelData` antes de organizar.
+  - Quarentena automática de arquivos inválidos.
+
+### Boas práticas com `pydicom`
+- Use `stop_before_pixels=True` apenas para leitura de metadados, sem regravação do arquivo original.
+- Se houver qualquer chance de modificar e salvar o DICOM, leia o arquivo completo (sem `stop_before_pixels=True`).
+- Em fluxo clínico, priorize integridade dos pixels sobre micro-otimização de memória.
+
 ## Deploy e Inicialização (Linux Server)
+
+## Parametrização por Clínica (`.env`)
+
+O projeto foi estruturado para reutilização entre clínicas alterando apenas o arquivo `.env` (sem editar código).
+
+### Variáveis principais
+- `HTR_IP`: IP local onde o SCP escuta o recebimento DICOM
+- `SCP_PORT`: porta do SCP (padrão `104`)
+- `SCP_AET`: AE Title do receptor local
+- `DICOM_ROOT`: caminho interno de armazenamento nos containers (padrão `/home/dicom`)
+- `TARGET_HOST`: IP do destino (ZeroClick por padrão `192.168.10.16`)
+- `TARGET_PORT`: porta do destino (padrão `4243`)
+- `TARGET_AET`: AE Title do destino (padrão `ZEROCLICK`)
+
+### Novo ambiente (outra clínica)
+1. Copie `.env.example` para `.env`
+2. Ajuste os valores da clínica
+3. Rebuild/recrie os containers
+
+```bash
+cp .env.example .env
+sudo docker compose up -d --build
+```
 
 ### Pré-requisitos
 *   Docker e Docker Compose instalados.
@@ -125,4 +176,29 @@ Para garantir que o serviço inicie automaticamente com o servidor e possa ser g
     ```
 *   **Via Dashboard Web:**
     Acesse `http://<IP_DO_SERVIDOR>:8501` para visualizar logs em tempo real e reiniciar serviços individualmente.
+
+## Atualização de Código em Containers (Importante)
+
+Os serviços `storescp` e `storescu` são construídos por imagem Docker (`build:`) e **não** montam o código `./scp` / `./scu` como volume.  
+Isso significa que alterar arquivos `.py` no host **não atualiza** automaticamente o código em execução dentro do container.
+
+### Após alterar código Python
+Rebuild e recrie os containers:
+
+```bash
+cd /home/prowess/dicomrs
+sudo docker compose up -d --build storescp storescu
+```
+
+Se também houver alteração no dashboard:
+
+```bash
+sudo docker compose up -d --build storescp storescu dashboard
+```
+
+### Verificação pós-restart
+```bash
+sudo docker compose ps
+sudo docker compose logs -f storescp storescu
+```
 # DICOM-Router

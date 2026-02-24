@@ -30,17 +30,28 @@ TARGET_PORT = os.getenv("TARGET_PORT", "4243")
 TARGET_AET = os.getenv("TARGET_AET", "ZEROCLICK")
 
 # Diretórios
-WATCH_FOLDER = Path("/home/dicom")
+WATCH_FOLDER = Path(os.getenv("DICOM_ROOT", "/home/dicom"))
 METADATA_FILE = WATCH_FOLDER / ".metadata.json"
 STATUS_FILE = WATCH_FOLDER / ".send_status.json"
+QUARANTINE_FOLDER = WATCH_FOLDER / "_INVALID_NO_PIXELS"
+
+IMAGE_MODALITIES = {
+    "CR", "CT", "DX", "IO", "MG", "MR", "NM", "OT", "PT", "RF",
+    "RTIMAGE", "US", "XA", "XC",
+}
 
 def sanitize_filename(text):
     """Remove caracteres inválidos"""
     if not text:
         return "UNKNOWN"
+    # Substitui separadores DICOM de PersonName por espaço
+    text = text.replace('^', ' ').replace('=', ' ')
+    # Remove caracteres problemáticos para filesystem
     invalid_chars = '<>:"/\\|?*'
     for char in invalid_chars:
         text = text.replace(char, '_')
+    # Colapsa espaços múltiplos e limita tamanho
+    text = ' '.join(text.split())
     return text.strip()[:50] or "UNKNOWN"
 
 def load_metadata():
@@ -89,6 +100,72 @@ def clean_study_description(ds):
         desc_clean = desc_clean.encode('utf-8', errors='replace').decode('utf-8')
         ds.StudyDescription = desc_clean
 
+def read_dicom_metadata_only(filepath):
+    """
+    Lê apenas metadados e marca o dataset como leitura sem pixels.
+    Use safe_save_dicom() se algum dia precisar regravar.
+    """
+    ds = pydicom.dcmread(filepath, stop_before_pixels=True)
+    ds._read_without_pixels = True
+    return ds
+
+def dataset_requires_pixel_data(ds):
+    """Heurística conservadora: imagens devem ter PixelData."""
+    modality = str(getattr(ds, "Modality", "")).upper()
+    if modality in IMAGE_MODALITIES:
+        return True
+    return hasattr(ds, "Rows") and hasattr(ds, "Columns")
+
+def dataset_has_pixel_data(ds):
+    return (
+        "PixelData" in ds
+        or "FloatPixelData" in ds
+        or "DoubleFloatPixelData" in ds
+    )
+
+def safe_save_dicom(ds, filepath):
+    """
+    Bloqueia gravação acidental de datasets lidos sem pixels.
+    Isso evita corromper arquivos de imagem por save_as() após stop_before_pixels=True.
+    """
+    if getattr(ds, "_read_without_pixels", False) and dataset_requires_pixel_data(ds):
+        raise RuntimeError(
+            "Bloqueado: tentativa de salvar DICOM lido com stop_before_pixels=True. "
+            "Isso pode remover PixelData."
+        )
+    ds.save_as(filepath)
+
+def validate_image_dicom_has_pixels(filepath):
+    """
+    Valida se um DICOM de imagem contém pixel data.
+    Retorna (ok, motivo).
+    """
+    if not HAS_PYDICOM:
+        return True, "pydicom indisponível"
+    try:
+        ds = pydicom.dcmread(filepath, stop_before_pixels=False)
+    except Exception as e:
+        return False, f"falha ao ler DICOM: {e}"
+
+    if not dataset_requires_pixel_data(ds):
+        return True, "não é imagem"
+    if not dataset_has_pixel_data(ds):
+        return False, "DICOM de imagem sem PixelData"
+    return True, "ok"
+
+def quarantine_invalid_dicom(filepath, reason):
+    """Move arquivo inválido para quarentena para análise manual."""
+    src = Path(filepath)
+    QUARANTINE_FOLDER.mkdir(parents=True, exist_ok=True)
+    dest = QUARANTINE_FOLDER / src.name
+    counter = 1
+    while dest.exists():
+        dest = QUARANTINE_FOLDER / f"{src.stem}_{counter}{src.suffix}"
+        counter += 1
+    shutil.move(str(src), str(dest))
+    print(f"🚫 DICOM inválido movido para quarentena: {dest.name} ({reason})")
+    return dest
+
 def get_or_create_study_folder(filepath):
     """
     Obtém ou cria pasta do estudo baseado nos metadados DICOM
@@ -99,9 +176,10 @@ def get_or_create_study_folder(filepath):
     
     if HAS_PYDICOM:
         try:
-            ds = pydicom.dcmread(filepath, stop_before_pixels=True)
+            ds = read_dicom_metadata_only(filepath)
             clean_study_description(ds)
-            ds.save_as(filepath)  # Salva o arquivo já limpo
+            # Nao regravar o DICOM apos leitura com stop_before_pixels=True:
+            # isso pode salvar o arquivo sem PixelData e corromper a imagem.
             study_uid = str(getattr(ds, 'StudyInstanceUID', ''))
             patient_id = sanitize_filename(str(getattr(ds, 'PatientID', 'UNKNOWN')))
             patient_name = sanitize_filename(str(getattr(ds, 'PatientName', 'UNKNOWN')))
@@ -188,6 +266,16 @@ def send_and_organize(file_path):
         return False
     
     print(f"📤 Enviando: {filepath.name}")
+
+    # Trava de integridade: nao processa imagem DICOM sem pixels.
+    ok_pixels, reason = validate_image_dicom_has_pixels(str(filepath))
+    if not ok_pixels:
+        print(f"❌ Arquivo DICOM inválido: {filepath.name} ({reason})")
+        try:
+            quarantine_invalid_dicom(str(filepath), reason)
+        except Exception as e:
+            print(f"⚠ Falha ao mover para quarentena {filepath.name}: {e}")
+        return False
     
     # Primeiro, determina a pasta de destino
     dest_folder, study_uid = get_or_create_study_folder(str(filepath))
