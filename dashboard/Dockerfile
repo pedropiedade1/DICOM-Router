@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir streamlit docker pandas
+RUN pip install --no-cache-dir streamlit docker pandas pydicom numpy Pillow
 
 COPY app_v2.py /app/app.py
 
